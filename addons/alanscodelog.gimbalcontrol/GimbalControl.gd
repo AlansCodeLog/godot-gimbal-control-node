@@ -1,15 +1,15 @@
-#GimbalControl Node v0.0.1
+#GimbalControl Node v0.1.0
 
-#  Notes:
+#	Notes:
 #	- To use as a camera gimbal, just place a camera inside and reset it's rotation if it was rotated.
-#  - All offsets/transforms of it's children are kept.
-#  - Do not scale parent nodes though, everything gets messed up. 
-#  - If the target is a sibling of the node, it MUST be above the node in the hierarchy (so that it moves first).
-#  - Technically this script could be made to extend a camera node, but this way you could move anything
-#    with the gimbal (e.g. change lighting by rotating a light around a point)
-#  - An interpolated camera can be used to target the node itself, but it zooms in a bit weird when rotating around.
-#  - While running, you can't change its "origin/basis" when not in target mode. 
-#	- To "reset" the rotation (relative to it's current target or real transform), you should use set_rotation_to(right/left,up/down).
+# 	- All offsets/transforms of it's children are kept.
+#	- Do not scale parent nodes though, everything gets messed up. 
+#	- If the target is a sibling of the node, it MUST be above the node in the hierarchy (so that it moves first).
+#	- Technically this script could be made to extend a camera node, but this way you could move anything
+#	  with the gimbal (e.g. change lighting by rotating a light around a point)
+#	- An interpolated camera can be used to target the node itself, but it zooms in a bit weird when rotating around.
+#	- While running, you can't change the "origin/basis".
+#	- To "reset" the rotation (relative to it's current target or real transform), you should use set_rotation_to(right/left in degrees,up/down in degrees).
 #  - Note that keyboard ghosting can prevent multiple keys being registered (as might be the case if you're moving/looking only with keys)
 
 extends Spatial
@@ -25,14 +25,23 @@ signal first_person_exited(distance)
 export (NodePath) var target setget set_target, get_target
 
 #whether when we change a target as we move closer to it or stay the same distance
+#or min/max distance if out of range
 export (bool) var move_to_target_on_change = true
-
 #whether to interpolate target changes (rotation, location optional)
 export (bool) var interpolate_target_change = true
-#multiplier for target change interpolations, higher is faster.
-export (int) var interpolation_speed = 2
 #if move_to_target_on_change is true, allow zooming to stop the distance interpolation (rotation can't be stopped)
-export (bool) var allow_stop_move_interpolation = false
+export (bool) var allow_stop_move_interpolation = true
+
+#whether to interpolate the set_rotation_to method
+#this will correctly rotate around the target/origin in an arc 
+#the translation is not interpolated, it will move with the target at the speed the target moves
+export (bool) var interpolate_set_rotation_to = true
+#when you use set_rotation_to and interpolate_set_rotation_to is true, allows any movement to stop the interpolation
+#will not stop rotations when interpolating between targets
+export (bool) var allow_stop_rotation_interpolation = true
+
+#multiplier for interpolations, higher is faster.
+export (float) var interpolation_speed = 2
 
 #whether it tilts with it's parent/target or stays aligned to the global axis
 export (bool) var rotate_globally = false setget set_rotate_globally, get_rotate_globally
@@ -169,11 +178,17 @@ var interpo_end = {
 	"look_target": null
 }
 var interpo_start #initial transform
+var interpo_is_rotation = false
 var slerp_value = 0
 var lerp_value = 0
 var lerp_stop = false
+var rotation_stop = false
 
 func set_rotation_to(rotation_vector):
+	var start = {
+		"origin": original_global_transform.origin if !target else target.global_transform.origin,
+		"basis": global_transform.basis
+	}
 	if target_mode:
 		global_transform.origin = target.global_transform.origin
 	else:
@@ -188,13 +203,23 @@ func set_rotation_to(rotation_vector):
 	
 	if !rotate_globally:
 		#apply correct basis if not rotating globally
-		var basis = original_global_transform.basis if !target_mode else target.global_transform.basis
+		var basis = target.global_transform.basis if target_mode else original_global_transform.basis
 		start_position = 	basis * start_position
-	
-	global_transform.origin = original_global_transform.origin
+
+	global_transform.origin = original_global_transform.origin if !target else target.global_transform.origin
 	global_translate(start_position * current_distance)
 	
-	align_to_target(true)
+	#must be set like this otherwise end is a Transform and other properties can't be assigned
+	var end = {
+		"origin": global_transform.origin
+	}
+	
+	if interpolate_set_rotation_to:
+		interpo_is_rotation = true
+		align_to_target(start, end)
+	else:
+		interpo_is_rotation = false
+		align_to_target()
 	
 func get_target():
 	return target
@@ -226,7 +251,7 @@ func set_rotate_globally(value):
 	if ready:
 		align_to_target()
 	
-func align_to_target(do_not_interpolate = false):
+func align_to_target(start = null, end = null):
 	var look_target_transform = target.global_transform if target_mode else original_global_transform
 	var look_target = look_target_transform.origin 
 	var vector_up = Vector3(0,1,0) #global
@@ -235,7 +260,7 @@ func align_to_target(do_not_interpolate = false):
 		var target_basis = look_target_transform.basis
 		vector_up = target_basis * Vector3(0,1,0)
 	
-	var initial_basis = global_transform.basis
+	var initial_transform = global_transform
 	
 	#will handle looking at target and setting orientation correctly
 	if look_target != global_transform.origin:
@@ -253,33 +278,62 @@ func align_to_target(do_not_interpolate = false):
 			global_transform.basis = look_target_transform.basis #todo mix with rotation, just change z?
 		else: 
 			rotation.z = 0 #we just need to untilt the node
-			
-	var final_basis = global_transform.basis
 	
-	if !first_call_target and interpolate_target_change and !do_not_interpolate:
-		#reset the transform so now we can slowly transition to the new one
-		global_transform.basis = initial_basis
-		interpo_end = {
-			"basis": final_basis,
-			"look_target": look_target
-		}
-		force_transform()
+	var new_distance
+	if !move_to_target_on_change:
+		new_distance = look_target.distance_to(initial_transform.origin)
+		if new_distance < min_distance:
+			current_distance = min_distance
+		elif new_distance > max_distance:
+			current_distance = max_distance
+	else:
+		current_distance = current_distance
 		
-func force_transform():
-	forcing_transform = true
-	interpo_start = global_transform
-	interpo_end.origin = interpo_end.look_target + (interpo_start.origin - interpo_end.look_target).normalized() * current_distance
+	global_transform.origin = look_target + (initial_transform.origin - look_target).normalized() * current_distance
+	
+	var final_transform = global_transform
+	
+	if interpo_is_rotation or (!first_call_target and interpolate_target_change):
+		
+		#reset the transform so now we can slowly transition to the new one
+		global_transform.origin = initial_transform.origin
+		global_transform.basis = initial_transform.basis
+		
+		if start == null:
+			start =  {
+				"basis": global_transform.basis,
+				"origin": global_transform.origin
+			}
+		
+		if end == null:
+			end = {}
+			end.origin = final_transform.origin
+		
+		end.basis = final_transform.basis
+		end.look_target = look_target
+		
+		force_transform(start, end)
+		
+func force_transform(start, end):
+	interpo_start = start
+	interpo_end = end
+	lerp_value = 0
+	slerp_value = 0
+	forcing_transform = true #must be set last
 	
 func rotation_slerp(delta):
 	slerp_value += delta * interpolation_speed
 	if slerp_value > 1:
 		slerp_value = 1
-		
-	var current_rotation = Quat(interpo_start .basis).slerp(interpo_end.basis, slerp_value)
-	global_transform.basis = Basis(current_rotation)
 	
-	if slerp_value == 1:
+	if !rotation_stop:
+		var current_rotation = Quat(interpo_start.basis).slerp(interpo_end.basis, slerp_value)
+		global_transform.basis = Basis(current_rotation)
+	
+	if slerp_value == 1 or rotation_stop:
+		#only slerp should reset these
 		forcing_transform = false
+		rotation_stop = false
 		movement = Vector3()
 		slerp_value = 0
 
@@ -288,13 +342,27 @@ func location_lerp(delta):
 	if lerp_value > 1:
 		lerp_value = 1
 		
-	if !lerp_stop:
-		var current_location = interpo_start.origin.linear_interpolate(interpo_end.origin, lerp_value)
-		global_transform.origin = current_location
-		
+	if !lerp_stop and !rotation_stop:
+		#if we're not changing targets we want the interpolation to be at the correct distance from the target/origin
+		#to make it travel in an arc we do the same thing as when we move normally, and translate after rotating
+		#this is why the slerp has to be called first
+		#there's no need to actually interpolate
+		if interpo_is_rotation:
+			if !target_mode:
+				global_transform.origin = interpo_start.origin
+			else:
+				global_transform.origin = target.global_transform.origin #we can't use interpo start because this can have changed
+				
+			translate(Vector3(0,0, current_distance))
+#		regular interpolation
+		elif target_mode: #there should never be any reason why we're not in target mode
+			global_transform.origin = interpo_start.origin.linear_interpolate(target.global_transform.origin + interpo_end.basis * Vector3(0,0,current_distance), lerp_value)
+	
 	if lerp_value == 1:
 		lerp_value = 0
-
+		#lerp should rest this one as only it uses it
+		interpo_is_rotation = false
+		
 func _ready():
 	
 	ready = true
@@ -448,7 +516,7 @@ func _input(event):
 		if mouse_dragging and event.is_class("InputEventMouseMotion"):
 			var mouse_move = event.relative
 			movement = Vector3(mouse_move.x if reverse_left_right else -mouse_move.x, mouse_move.y if reverse_up_down else -mouse_move.y, movement.z)
-	
+
 
 #APPLY MOVEMENT
 #once input has processed we get a vector (right/left, up/down, zoomin/out) to change movement
@@ -566,10 +634,17 @@ func _process(delta):
 			
 	elif forcing_transform:
 		#in mid transform, zooming can stop the distance interpolation if allowed
-		if movement.z !=0 and move_to_target_on_change and allow_stop_move_interpolation:
-			lerp_stop = true
-			current_distance = global_transform.origin.distance_to(interpo_end.look_target)
-			
+		if movement.z !=0:
+			if move_to_target_on_change and allow_stop_move_interpolation:
+				var new_distance = global_transform.origin.distance_to(target.global_transform.origin if target else interpo_end.look_target)
+				if new_distance > min_distance < max_distance:
+					lerp_stop = true
+					current_distance = new_distance
+					
+		if allow_stop_rotation_interpolation and interpo_is_rotation and movement.length() !=0:
+			rotation_stop = true
+				
 		#if forcing_transform we call the interpolations
+		#rotation must be called first
 		rotation_slerp(delta)
 		location_lerp(delta)
